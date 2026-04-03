@@ -22,7 +22,6 @@ jobs:
         with:
           github-token: ${{ secrets.GITHUB_TOKEN }}
           images: |
-            ${{ github.repository }}
             ghcr.io/${{ github.repository }}
           flavor: |
             latest=true
