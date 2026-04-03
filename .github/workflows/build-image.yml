@@ -10,16 +10,52 @@ permissions:
   packages: write
 
 jobs:
+  check-versions:
+    runs-on: ubuntu-latest
+    outputs:
+      needs_build: ${{ steps.check.outputs.needs_build }}
+      caddy_version: ${{ steps.check.outputs.caddy_version }}
+      go_version: ${{ steps.check.outputs.go_version }}
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Check for new versions
+        id: check
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          CADDY_VERSION=$(gh release view --repo caddyserver/caddy --json tagName -q '.tagName')
+          GO_VERSION=$(curl -fsSL 'https://go.dev/dl/?mode=json' | jq -r '.[0].version' | sed 's/^go//')
+
+          echo "caddy_version=$CADDY_VERSION" >> "$GITHUB_OUTPUT"
+          echo "go_version=$GO_VERSION" >> "$GITHUB_OUTPUT"
+
+          if [ -f .last-built-versions ]; then
+            LAST_CADDY=$(grep '^caddy=' .last-built-versions | cut -d= -f2)
+            LAST_GO=$(grep '^go=' .last-built-versions | cut -d= -f2)
+          else
+            LAST_CADDY=""
+            LAST_GO=""
+          fi
+
+          if [ "$CADDY_VERSION" != "$LAST_CADDY" ] || [ "$GO_VERSION" != "$LAST_GO" ]; then
+            echo "needs_build=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "needs_build=false" >> "$GITHUB_OUTPUT"
+          fi
+
   build-binaries:
     runs-on: ubuntu-latest
+    needs: check-versions
+    if: github.event_name != 'schedule' || needs.check-versions.outputs.needs_build == 'true'
     steps:
       - uses: actions/checkout@v6
 
       - name: Set up Go
         uses: actions/setup-go@v6
         with:
-          go-version: '1.26'
-          cache: true # Reuses modules across runs
+          go-version: ${{ needs.check-versions.outputs.go_version }}
+          cache: true
 
       - name: Install xcaddy
         run: go install github.com/caddyserver/xcaddy/cmd/xcaddy@latest
@@ -43,9 +79,11 @@ jobs:
         with:
           name: caddy-bins
           path: bin/
+
   docker:
     runs-on: ubuntu-latest
-    needs: build-binaries
+    needs: [check-versions, build-binaries]
+    if: github.event_name != 'schedule' || needs.check-versions.outputs.needs_build == 'true'
     steps:
       - name: Checkout
         uses: actions/checkout@v6
@@ -55,7 +93,7 @@ jobs:
         with:
           name: caddy-bins
           path: bin/
-        
+
       - name: Docker meta
         id: meta
         uses: docker/metadata-action@v6
@@ -68,10 +106,11 @@ jobs:
           tags: |
             type=schedule,pattern={{date 'YYYYMMDD'}}
             type=ref,enable=true,event=branch
+            type=raw,value=${{ needs.check-versions.outputs.caddy_version }}
           labels: |
             org.opencontainers.image.vendor=LasseSkogland
             maintainer=Lasse Skogland <lasse.skogland@gmail.com>
-            
+
       - name: Login to GitHub Container Registry
         uses: docker/login-action@v4
         with:
@@ -93,3 +132,13 @@ jobs:
           tags: ${{ steps.meta.outputs.tags }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
+
+      - name: Update version tracking file
+        run: |
+          echo "caddy=${{ needs.check-versions.outputs.caddy_version }}" > .last-built-versions
+          echo "go=${{ needs.check-versions.outputs.go_version }}" >> .last-built-versions
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add .last-built-versions
+          git diff --cached --quiet || git commit -m "chore: update last built versions [skip ci]"
+          git push
